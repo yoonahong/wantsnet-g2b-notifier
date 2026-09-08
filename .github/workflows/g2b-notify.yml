@@ -1,373 +1,42 @@
-requests
-
-name: 나라장터 공고 알림 메일 발송
+name: g2b notify
 
 on:
   schedule:
-    # 매일 한국시간(KST) 오전 9:30 = UTC 00:30
-    - cron: "30 0 * * *"
-  workflow_dispatch: {}   # 필요할 때 수동 실행 버튼도 사용 가능
+    - cron: 45 2 * * *
+  workflow_dispatch: {}
 
 permissions:
-  contents: write   # sent_bids.json 변경사항을 저장소에 커밋하기 위해 필요
+  contents: write
 
 jobs:
   send-notice:
     runs-on: ubuntu-latest
     steps:
-      - name: 저장소 체크아웃
+      - name: checkout
         uses: actions/checkout@v4
 
-      - name: 파이썬 설치
+      - name: setup python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: 3.11
 
-      - name: 의존 패키지 설치
+      - name: install deps
         run: pip install requests
 
-      - name: 스크립트 실행 (공고 조회 및 메일 발송)
+      - name: run script
         env:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           G2B_API_KEY: ${{ secrets.G2B_API_KEY }}
         run: python 나라장터_공고.py
 
-      - name: 발송 이력(sent_bids.json) 저장소에 반영
+      - name: commit sent_bids.json
         run: |
           if [ -n "$(git status --porcelain sent_bids.json)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name github-actions[bot]
+            git config user.email github-actions[bot]@users.noreply.github.com
             git add sent_bids.json
-            git commit -m "chore: 발송 이력 업데이트 [skip ci]"
+            git commit -m "update sent bids"
             git push
           else
-            echo "변경된 발송 이력 없음"
+            echo no changes
           fi
-
-from datetime import datetime, timedelta
-import json
-import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-import requests
-
-# ==================== [설정 영역] ====================
-# 하이웍스 오피스 SMTP 설정
-SMTP_SERVER = "smtps.hiworks.com"
-SMTP_PORT = 465
-SENDER_EMAIL = "yoona@wantsnet.co.kr"
-RECEIVER_EMAIL = "yoona@wantsnet.co.kr"
-
-# 🔒 민감정보(비밀번호/인증키)는 코드에 직접 넣지 않고 환경변수(GitHub Secrets)에서 불러옵니다.
-SENDER_PASSWORD = os.environ["SMTP_PASSWORD"]
-API_KEY = os.environ["G2B_API_KEY"]
-
-# 검색 조건 설정 (원하시는 키워드 리스트)
-KEYWORDS = [
-    "정보시스템 구축",
-    "구축",
-    "통합 유지",
-    "고도화",
-    "네트워크",
-    "시스템 용역",
-    "컨설팅",
-]
-
-# 상세 키워드 간의 포함 관계 충돌 방지를 위해 긴 키워드 우선순위 정렬
-SORTED_KEYWORDS = sorted(KEYWORDS, key=len, reverse=True)
-
-# 🔴 자동화 모드 설정 (False: 오늘/어제 기준 자동으로 일일 조회)
-TEST_MODE = False
-TEST_START_DATE = "20260801"
-TEST_END_DATE = "20260831"
-
-MAX_DAYS_PER_CALL = 31
-
-# 이미 발송한 공고(공고번호) 기록 파일 및 보관 기간
-SENT_BIDS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "sent_bids.json"
-)
-SENT_BIDS_RETENTION_DAYS = 15
-# ===================================================
-
-
-def load_sent_bids():
-  """이미 발송한 공고번호 기록을 불러옵니다. {공고번호: 발송일(YYYYMMDD)}"""
-  if not os.path.exists(SENT_BIDS_FILE):
-    return {}
-  try:
-    with open(SENT_BIDS_FILE, "r", encoding="utf-8") as f:
-      return json.load(f)
-  except (json.JSONDecodeError, OSError):
-    return {}
-
-
-def cleanup_sent_bids(sent_bids):
-  """보관 기간(SENT_BIDS_RETENTION_DAYS)이 지난 발송 기록을 제거합니다."""
-  cutoff = datetime.now() - timedelta(days=SENT_BIDS_RETENTION_DAYS)
-  cleaned = {}
-  for bid_no, sent_date_str in sent_bids.items():
-    try:
-      sent_date = datetime.strptime(sent_date_str, "%Y%m%d")
-    except ValueError:
-      continue
-    if sent_date >= cutoff:
-      cleaned[bid_no] = sent_date_str
-  return cleaned
-
-
-def save_sent_bids(sent_bids):
-  with open(SENT_BIDS_FILE, "w", encoding="utf-8") as f:
-    json.dump(sent_bids, f, ensure_ascii=False, indent=2)
-
-
-def mark_bids_as_sent(bids_by_keyword):
-  """이번에 실제로 발송한 공고들의 공고번호를 오늘 날짜로 기록합니다."""
-  sent_bids = load_sent_bids()
-  sent_bids = cleanup_sent_bids(sent_bids)
-  today_str = datetime.now().strftime("%Y%m%d")
-  for bids in bids_by_keyword.values():
-    for b in bids:
-      if b.get("bid_no"):
-        sent_bids[b["bid_no"]] = today_str
-  save_sent_bids(sent_bids)
-
-
-def get_date_range():
-  if TEST_MODE:
-    return TEST_START_DATE, TEST_END_DATE
-  today = datetime.now()
-  week_ago = today - timedelta(days=7)
-  # 매일 실행 시 최근 7일~오늘(또는 당일) 데이터를 조회합니다.
-  # (실행이 하루 이틀 누락되어도 공고를 놓치지 않도록 넉넉히 조회하며,
-  #  공고번호 기준 중복 제거로 실제로는 신규 공고만 걸러집니다.)
-  return week_ago.strftime("%Y%m%d"), today.strftime("%Y%m%d")
-
-
-def split_date_range(start_str, end_str, max_days):
-  start = datetime.strptime(start_str, "%Y%m%d")
-  end = datetime.strptime(end_str, "%Y%m%d")
-  chunks = []
-  cur = start
-  while cur <= end:
-    chunk_end = min(cur + timedelta(days=max_days - 1), end)
-    chunks.append((cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")))
-    cur = chunk_end + timedelta(days=1)
-  return chunks
-
-
-def fetch_g2b_bids_for_range(start_date, end_date):
-  # 서비스키는 이미 인코딩되어 있으므로 URL에 직접 결합 (이중 인코딩 방지)
-  url = f"https://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoServcPPSSrch?serviceKey={API_KEY}"
-
-  params = {
-      "inqryDiv": "1",
-      "inqryBgnDt": f"{start_date}0000",
-      "inqryEndDt": f"{end_date}2359",
-      "numOfRows": "100",
-      "pageNo": "1",
-      "type": "json",
-  }
-
-  try:
-    response = requests.get(url, params=params, timeout=15)
-
-    if response.status_code != 200:
-      print(
-          f"[{start_date}~{end_date}] API 서버 접속 실패 (상태 코드:"
-          f" {response.status_code})"
-      )
-      return []
-
-    try:
-      data = response.json()
-    except json.JSONDecodeError:
-      return []
-
-    header = data.get("response", {}).get("header", {})
-    result_code = header.get("resultCode")
-
-    if result_code not in (None, "00", "0"):
-      return []
-
-    items = data.get("response", {}).get("body", {}).get("items", [])
-    if not items:
-      return []
-    if isinstance(items, dict):
-      items = [items]
-
-    bids = []
-    for item in items:
-      title = item.get("bidNtceNm", "제목 없음")
-      org = item.get("ntceInsttNm", "기관 정보 없음")
-      deadline = item.get("bidClseDt", "마감일시 미정")
-      link = item.get("bidNtceDtlUrl", "https://www.g2b.go.kr")
-      bid_no = item.get("bidNtceNo", "")
-
-      if any(kw in title for kw in KEYWORDS):
-        bids.append({
-            "title": title,
-            "org": org,
-            "deadline": deadline,
-            "link": link,
-            "bid_no": bid_no,
-        })
-
-    return bids
-
-  except Exception as e:
-    print(f"[{start_date}~{end_date}] 데이터 수집 중 오류 발생: {e}")
-    return []
-
-
-def fetch_g2b_bids():
-  start_date, end_date = get_date_range()
-  print(f"나라장터 오픈 API를 통해 공고 조회 중... ({start_date} ~ {end_date})")
-
-  all_bids = []
-  for chunk_start, chunk_end in split_date_range(
-      start_date, end_date, MAX_DAYS_PER_CALL
-  ):
-    all_bids.extend(fetch_g2b_bids_for_range(chunk_start, chunk_end))
-
-  # 이미 발송한 공고번호 기록 로드 + 보관 기간 지난 기록 정리 후 즉시 저장
-  sent_bids = load_sent_bids()
-  sent_bids = cleanup_sent_bids(sent_bids)
-  save_sent_bids(sent_bids)
-
-  seen = set()
-  bids_by_keyword = {kw: [] for kw in KEYWORDS}
-  skipped_already_sent = 0
-
-  for b in all_bids:
-    dedup_key = b["bid_no"] or (b["title"], b["org"], b["deadline"])
-    if dedup_key in seen:
-      continue
-    seen.add(dedup_key)
-
-    # 공고번호 기준으로 이미 발송한 공고는 제외
-    if b["bid_no"] and b["bid_no"] in sent_bids:
-      skipped_already_sent += 1
-      continue
-
-    for kw in SORTED_KEYWORDS:
-      if kw in b["title"]:
-        bids_by_keyword[kw].append(b)
-        break
-
-  total_count = sum(len(v) for v in bids_by_keyword.values())
-  print(
-      f"중복/기발송 {skipped_already_sent}건 제외 후 총 {total_count}건의"
-      " 신규 공고를 수집했습니다."
-  )
-  return bids_by_keyword
-
-
-def send_hiworks_email(bids_by_keyword):
-  start_date, end_date = get_date_range()
-  total_count = sum(len(v) for v in bids_by_keyword.values())
-
-  # 화면 표시용 날짜 포맷 (yyyy.mm.dd) - API 호출용 원본(yyyymmdd)은 그대로 유지
-  def format_display_date(date_str):
-    return f"{date_str[:4]}.{date_str[4:6]}.{date_str[6:8]}"
-
-  start_date_display = format_display_date(start_date)
-  end_date_display = format_display_date(end_date)
-
-  msg = MIMEMultipart()
-  msg["From"] = SENDER_EMAIL
-  msg["To"] = RECEIVER_EMAIL
-
-  msg["Subject"] = (
-      f"[📢 입찰 공고 알림] 총 {total_count}건의 신규 공고가 도착했습니다! ✨"
-      f" ({start_date_display}~{end_date_display})"
-  )
-
-  # 키워드별 색상 팔레트 (진한 강조색, 옅은 배경색) - 오렌지·핑크 헤더와 어울리는 톤으로 구성
-  KEYWORD_PALETTE = [
-      ("#f43f5e", "#fff1f2"),  # 코랄레드
-      ("#f59e0b", "#fffbeb"),  # 앰버골드
-      ("#a855f7", "#faf5ff"),  # 퍼플
-      ("#14b8a6", "#f0fdfa"),  # 틸
-      ("#0ea5e9", "#f0f9ff"),  # 스카이블루
-      ("#f472b6", "#fdf2f8"),  # 로즈핑크
-  ]
-  keyword_colors = {
-      kw: KEYWORD_PALETTE[i % len(KEYWORD_PALETTE)] for i, kw in enumerate(KEYWORDS)
-  }
-
-  html_content = f"""
-    <div style="font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', Arial, sans-serif; padding: 24px; background-color: #f4f6f9; color: #24292e;">
-        <div style="max-width: 700px; margin: 0 auto; background: #ffffff; padding: 0; border-radius: 10px; overflow: hidden; border: 1px solid #e1e4e8; box-shadow: 0 1px 3px rgba(0,0,0,0.06);">
-            <div style="background: linear-gradient(135deg, #f97316, #ec4899); color: #ffffff; padding: 24px 28px;">
-                <div style="font-size: 12px; letter-spacing: 0.5px; opacity: 0.75; margin-bottom: 6px;">WANTSNET · G2B 나라장터</div>
-                <div style="font-size: 19px; font-weight: bold; line-height: 1.4;">💡 원츠넷이 관심 가질 만한 신규 입찰 공고 💡</div>
-                <div style="font-size: 13px; margin-top: 10px; opacity: 0.9;">조회 기간: {start_date_display} ~ {end_date_display} &nbsp;·&nbsp; 총 <b>{total_count}건</b></div>
-            </div>
-            <div style="padding: 28px;">
-    """
-
-  for kw, bids in bids_by_keyword.items():
-    count = len(bids)
-    if count > 0:
-      accent, tint = keyword_colors[kw]
-      html_content += f"""
-            <div style="margin-bottom: 28px;">
-                <div style="display: inline-block; background-color: {accent}; color: #ffffff; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: bold; margin-bottom: 14px;">
-                    🔍 "{kw}" <span style="font-weight: normal; opacity: 0.85;">· {count}건</span>
-                </div>
-                <ul style="list-style-type: none; padding-left: 0; margin: 0;">
-        """
-      for bid in bids:
-        html_content += f"""
-                    <li style="background: {tint}; margin-bottom: 10px; padding: 14px 16px; border-radius: 8px; border-left: 4px solid {accent};">
-                        <a href="{bid['link']}" target="_blank" style="color: #0a2540; text-decoration: none; font-weight: bold; font-size: 14px; line-height: 1.5;">
-                            {bid['title']}
-                        </a>
-                        <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; color: #57606a;">
-                            <span style="background: #ffffff; padding: 3px 9px; border-radius: 12px; border: 1px solid #e1e4e8;">🏢 {bid['org']}</span>
-                            <span style="background: #ffffff; padding: 3px 9px; border-radius: 12px; border: 1px solid #e1e4e8;">⏰ {bid['deadline']}</span>
-                        </div>
-                    </li>
-            """
-      html_content += """
-                </ul>
-            </div>
-        """
-
-  html_content += """
-            </div>
-            <div style="padding: 16px 28px; border-top: 1px solid #eaecef; text-align: center; color: #8a949e; font-size: 11px; background-color: #fafbfc;">
-                본 메일은 나라장터 오픈 API를 통해 자동으로 생성된 리포트입니다.
-            </div>
-        </div>
-    </div>
-    """
-
-  msg.attach(MIMEText(html_content, "html"))
-
-  try:
-    print("하이웍스 오피스 메일 서버로 전송 중...")
-    server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-    server.login(SENDER_EMAIL, SENDER_PASSWORD)
-    server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
-    server.quit()
-    print("✨ 하이웍스 메일 발송 성공!")
-    return True
-  except Exception as e:
-    print(f"❌ 하이웍스 메일 발송 실패: {e}")
-    return False
-
-
-if __name__ == "__main__":
-  bids_by_keyword = fetch_g2b_bids()
-  total_count = sum(len(v) for v in bids_by_keyword.values())
-
-  # 🔴 신규 공고가 0건일 경우 메일을 발송하지 않고 종료
-  if total_count > 0:
-    if send_hiworks_email(bids_by_keyword):
-      # 메일 발송에 성공한 공고만 "발송 완료"로 기록해 다음 실행에서 제외합니다.
-      mark_bids_as_sent(bids_by_keyword)
-  else:
-    print("🚫 조건에 일치하는 신규 공고가 없어 메일을 발송하지 않습니다.")
